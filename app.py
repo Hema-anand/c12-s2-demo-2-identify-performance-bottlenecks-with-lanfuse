@@ -1,4 +1,14 @@
-"""Flask multi-agent demo with Gemini and Langfuse observability."""
+"""Flask API demonstrating Langfuse latency and token/cost analysis.
+
+Workflow:
+- Research Agent: generates a research summary.
+- Analysis Agent: uses the research summary to answer the user's question.
+- SLOW_REQUEST=true injects a controlled delay inside the Research Agent path.
+- RESEARCH_DEPTH=standard keeps the default concise research summary.
+- RESEARCH_DEPTH=detailed raises the output-token budget
+  to make usage differences easier to inspect. Actual token usage/cost are not
+  guaranteed.
+"""
 
 import logging
 import os
@@ -13,31 +23,24 @@ from waitress import serve
 
 load_dotenv()
 
-EMAIL_PATTERN = re.compile(
-    r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
-    re.IGNORECASE,
-)
-PHONE_PATTERN = re.compile(r"(?<!\w)\+?\d[\d ().-]{7,}\d(?!\w)")
-
-
-def redact_pii(text):
-    """Mask common email addresses and phone numbers in text."""
-    if not isinstance(text, str):
-        return text
-    text = EMAIL_PATTERN.sub("[REDACTED_EMAIL]", text)
-    text = PHONE_PATTERN.sub("[REDACTED_PHONE]", text)
-    return text
-
-
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(levelname)s %(message)s",
-)
-
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 langfuse = get_client()
+
+
+def env_flag(name: str) -> bool:
+    """Read a boolean environment variable."""
+    return os.getenv(name, "false").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def get_research_depth() -> str:
+    """Resolve the research mode from the env var."""
+    research_depth = os.getenv("RESEARCH_DEPTH")
+    if research_depth is None:
+        return "detailed" if env_flag("RESEARCH_DEPTH") else "standard"
+    return research_depth.strip().lower() or "standard"
 
 
 def get_gemini_client():
@@ -48,156 +51,170 @@ def get_gemini_client():
     return genai.Client(api_key=api_key)
 
 
-def get_model_name():
-    """Return the configured Gemini model name."""
-    return os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+def redact_pii(text: str) -> str:
+    """Basic demo-only redaction for common email addresses and phone numbers."""
+    text = re.sub(
+        r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
+        "[REDACTED_EMAIL]",
+        text,
+    )
+    return re.sub(r"\b(?:\+?\d[\d .()-]{7,}\d)\b", "[REDACTED_PHONE]", text)
 
 
-def record_generation_result(generation, response):
-    """Record redacted output and usage returned by Gemini, when available."""
-    reply = response.text or "The model returned no text."
-    usage = getattr(response, "usage_metadata", None)
-
-    if usage:
-        # Langfuse v4 usage_details keys: input, output, total.
-        generation.update(
-            output=redact_pii(reply),
-            usage_details={
-                "input": getattr(usage, "prompt_token_count", None) or 0,
-                "output": getattr(usage, "candidates_token_count", None) or 0,
-                "total": getattr(usage, "total_token_count", None) or 0,
-            },
-        )
-    else:
-        generation.update(output=redact_pii(reply))
-
-    return reply
+def get_token_usage(response) -> dict:
+    """Extract token counts when Gemini returns usage metadata."""
+    metadata = getattr(response, "usage_metadata", None)
+    if metadata is None:
+        return {}
+    fields = {
+        "input": getattr(metadata, "prompt_token_count", None),
+        "output": getattr(metadata, "candidates_token_count", None),
+        "total": getattr(metadata, "total_token_count", None),
+    }
+    return {key: value for key, value in fields.items() if value is not None}
 
 
-def call_gemini(client, prompt, generation_name, *, inject_delay=False):
-    """Run one Gemini generation inside a named Langfuse generation."""
-    model_name = get_model_name()
-
+def call_gemini(
+    client,
+    model: str,
+    prompt: str,
+    observation_name: str,
+    max_output_tokens: int,
+    inject_delay: bool = False,
+) -> str:
+    """Call Gemini and record input, output, duration, and available usage."""
     with langfuse.start_as_current_observation(
         as_type="generation",
-        name=generation_name,
-        model=model_name,
-        input=redact_pii(prompt),
+        name=observation_name,
+        model=model,
+        input=prompt,
     ) as generation:
-        if inject_delay and os.getenv("SLOW_REQUEST", "false").lower() == "true":
+        if inject_delay:
             with langfuse.start_as_current_observation(
-                name="injected-delay",
                 as_type="span",
+                name="injected-delay",
                 input={"seconds": 3},
             ) as delay_span:
-                logging.info("Simulating a three-second delay in %s", generation_name)
                 time.sleep(3)
-                delay_span.update(output={"delay_seconds": 3, "status": "completed"})
+                delay_span.update(output="Completed controlled 3-second delay")
 
         response = client.models.generate_content(
-            model=model_name,
+            model=model,
             contents=prompt,
+            config={"max_output_tokens": max_output_tokens},
         )
-        return record_generation_result(generation, response)
+        reply = response.text or "The model returned no text."
+        generation.update(output=reply)
+
+        usage = get_token_usage(response)
+        if usage:
+            generation.update(usage_details=usage)
+
+        return reply
 
 
 @app.get("/health")
 def health():
     """Return application health and version."""
-    return jsonify(
-        status="ok",
-        version=os.getenv("APP_VERSION", "demo-2"),
-    )
+    return jsonify(status="ok", version=os.getenv("APP_VERSION", "local"))
 
 
 @app.post("/chat")
 def chat():
-    """Validate input, run two specialist agents, and capture a Langfuse trace."""
+    """Run a two-agent workflow and record it in Langfuse."""
     body = request.get_json(silent=True)
     message = body.get("message") if isinstance(body, dict) else None
 
     if not isinstance(message, str) or not message.strip():
         return jsonify(error="Provide a non-empty message string."), 400
-
     message = message.strip()
     if len(message) > 1000:
         return jsonify(error="Message must be at most 1000 characters."), 400
 
-    # Redact before sending user input to Gemini or recording it in Langfuse.
-    message = redact_pii(message)
+    safe_message = redact_pii(message)
+    model = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+    slow_request = env_flag("SLOW_REQUEST")
+    research_depth = get_research_depth()
+    detailed_research = research_depth in {
+        "deep",
+        "detailed",
+        "extended",
+        "verbose",
+        "high-budget"
+    }
+
+    # The larger budget permits, but does not guarantee, more output tokens.
+    research_token_limit = 1024 if detailed_research else 256
+    analysis_token_limit = 256
 
     try:
         with langfuse.start_as_current_observation(
             as_type="span",
             name="chat-request",
-            input={"message": message},
+            input={"message": safe_message},
         ) as trace:
             with langfuse.start_as_current_observation(
-                as_type="span",
-                name="validate-input",
+                as_type="span", name="validate-input"
             ) as span:
-                valid_message = message
                 span.update(output="Input validated")
 
             with langfuse.start_as_current_observation(
-                as_type="span",
-                name="retrieve-context",
+                as_type="span", name="retrieve-context"
             ) as span:
-                # Placeholder context: this demo does not retrieve external documents.
-                context = "No external documents were retrieved."
+                context = "No external documents were retrieved (demo placeholder)."
                 span.update(output=context)
 
             client = get_gemini_client()
 
-            # Agent 1: produce candidate job-search recommendations.
-            with langfuse.start_as_current_observation(
-                as_type="span",
-                name="research-agent",
-                input={"task": valid_message},
-            ) as research_span:
-                research_prompt = (
-                    "You are the Research Agent in a simple two-agent workflow. "
-                    "Generate three concise, practical ideas that answer the user's request. "
-                    "Do not claim to have searched the web or external sources.\n"
-                    f"Context: {context}\n"
-                    f"User request: {valid_message}"
+            if detailed_research:
+                research_instruction = (
+                    "You are the Research Agent. Produce a comprehensive research "
+                    "brief with these sections: overview, key concepts, detailed "
+                    "explanation, practical example, benefits, limitations, common "
+                    "mistakes, and conclusion. Explain each section in several "
+                    "sentences where relevant. Do not invent citations."
                 )
-                research_result = call_gemini(
-                    client,
-                    research_prompt,
-                    "research-generation",
-                    inject_delay=True,
+            else:
+                research_instruction = (
+                    "You are the Research Agent. Provide a concise summary with "
+                    "the main findings and key facts. Do not invent citations."
                 )
-                research_span.update(output=redact_pii(research_result))
 
-            # Agent 2: assess and prioritise Agent 1's recommendations.
-            with langfuse.start_as_current_observation(
-                as_type="span",
-                name="analysis-agent",
-                input={"research_result": redact_pii(research_result)},
-            ) as analysis_span:
-                analysis_prompt = (
-                    "You are the Analysis Agent. Review the recommendations from the "
-                    "Research Agent, remove repetition, and produce a clear final answer "
-                    "with three prioritised, actionable tips. Do not invent facts.\n"
-                    f"Original request: {valid_message}\n"
-                    f"Research Agent output:\n{redact_pii(research_result)}"
-                )
-                final_reply = call_gemini(
-                    client,
-                    analysis_prompt,
-                    "analysis-generation",
-                )
-                analysis_span.update(output=redact_pii(final_reply))
+            research_prompt = (
+                f"{research_instruction}\n\n"
+                f"Context: {context}\nQuestion: {safe_message}"
+            )
+            research_result = call_gemini(
+                client=client,
+                model=model,
+                prompt=research_prompt,
+                observation_name="research-generation",
+                max_output_tokens=research_token_limit,
+                inject_delay=slow_request,
+            )
+
+            analysis_prompt = (
+                "You are the Analysis Agent. Use the research notes to answer "
+                "the user's question directly. Summarize the key points and avoid "
+                "unnecessary repetition or unsupported claims.\n\n"
+                f"User question: {safe_message}\n\n"
+                f"Research notes:\n{research_result}"
+            )
+            final_reply = call_gemini(
+                client=client,
+                model=model,
+                prompt=analysis_prompt,
+                observation_name="analysis-generation",
+                max_output_tokens=analysis_token_limit,
+            )
 
             with langfuse.start_as_current_observation(
-                as_type="span",
-                name="format-response",
+                as_type="span", name="format-response"
             ) as span:
-                result = {"reply": redact_pii(final_reply)}
+                result = {"reply": final_reply}
                 span.update(output="Response formatted")
 
-            trace.update(output={"reply": redact_pii(result["reply"])})
+            trace.update(output=result)
 
         langfuse.flush()
         return jsonify(result)

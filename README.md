@@ -7,6 +7,7 @@
 Use Langfuse traces to investigate a multi-agent request and identify which steps contribute most to latency and token usage.
 
 By completing this demo, you will be able to:
+
 - Distinguish a trace from its child spans and observations.
 - Follow a request through a two-agent workflow.
 - Compare a baseline trace with a deliberately delayed trace.
@@ -77,7 +78,13 @@ LANGFUSE_PUBLIC_KEY=your_langfuse_public_key
 LANGFUSE_BASE_URL=https://cloud.langfuse.com
 
 SLOW_REQUEST=false
+RESEARCH_DEPTH=standard
 ```
+
+`RESEARCH_DEPTH` controls the Research Agent behavior:
+
+- `standard` keeps the concise summary mode and a 256-token output budget.
+- `detailed` increases the Research Agent output budget to 1024 tokens and asks for a more comprehensive brief.
 
 Use the Langfuse host URL appropriate to your project. Do not commit `.env` or share API keys. Keep the variable names consistent with the application code.
 
@@ -101,7 +108,7 @@ Confirm that the service reports a healthy status and the expected application v
 
 ### 2. Send a baseline request
 
-Set `SLOW_REQUEST=false` in `.env`, restart the application if needed, and send a request:
+Set `SLOW_REQUEST=false` and `RESEARCH_DEPTH=standard` in `.env`, restart the application if needed, and send a request:
 
 ```bash
 curl -X POST http://localhost:8080/chat \
@@ -109,30 +116,44 @@ curl -X POST http://localhost:8080/chat \
   -d '{"message":"Explain why application latency matters."}'
 ```
 
-Record the response and open the corresponding trace in Langfuse. Inspect the total trace duration and the durations of the Research Agent and Analysis Agent observations.
+Record the response and open the corresponding trace in Langfuse. Inspect the total trace duration and the durations of the Research Agent and Analysis Agent observations. This baseline run reflects the default concise research path.
 
-### 3. Send a deliberately delayed request
+### 3. Send a detailed-research request
+
+Set:
+
+```dotenv
+SLOW_REQUEST=false
+RESEARCH_DEPTH=detailed
+```
+
+Restart the application if required, then send the same request again. This variation increases the Research Agent output budget and asks for a more comprehensive brief, which will usually change the output token count and cost profile while keeping the analysis step unchanged.
+
+### 4. Send a deliberately delayed request
 
 Set:
 
 ```dotenv
 SLOW_REQUEST=true
+RESEARCH_DEPTH=standard
 ```
 
 Restart the application if required, then send the same request again. Find the new trace in Langfuse and inspect the `injected-delay` span and the surrounding Research Agent observation.
 
 The configured delay is approximately three seconds. Actual end-to-end duration can vary because of network, model, and service latency.
 
-### 4. Compare the traces
+### 5. Compare the traces
 
-For both traces, inspect:
+For the standard, detailed, and delayed traces, inspect:
+
 - Total trace duration.
 - Duration of each agent and generation observation.
 - Input, output, and total token usage, when reported.
 - Cost information, if Langfuse has the necessary model pricing/configuration and usage data.
 - Any errors or missing usage details.
+- Whether the deeper research mode changes the Research Agent output length and token footprint.
 
-Use the trace and span hierarchy to identify *where* time was spent. Do not assume that the longest span is always caused by model inference: inspect nested observations and the injected-delay span.
+Use the trace and span hierarchy to identify _where_ time was spent. Do not assume that the longest span is always caused by model inference: inspect nested observations, the injected-delay span, and the effect of the research depth setting.
 
 ## Tests
 
@@ -152,6 +173,7 @@ The chat test should account for **two Gemini generation calls**: one for the Re
 - **No token usage appears:** Check whether the model response includes usage metadata and whether the app records it. Usage reporting can vary by model/API.
 - **No cost appears:** Token usage and cost are different. Cost may be unavailable until model pricing is configured or recognized by Langfuse.
 - **No extra delay is visible:** Confirm `SLOW_REQUEST=true`, restart the app if environment values are loaded only at startup, and inspect the child observations under the Research Agent.
+- **Research output is unexpectedly long or short:** Check `RESEARCH_DEPTH` in `.env` and restart the app. `standard` uses the concise summary mode, while `detailed` requests a longer, higher-token research brief.
 
 ## Completion checklist
 
@@ -169,18 +191,18 @@ Complete this section after inspecting the actual Langfuse traces. Record measur
 
 ### Trace comparison
 
-| Observation | Baseline trace (`SLOW_REQUEST=false`) | Delayed trace (`SLOW_REQUEST=true`) |
-|---|---|---|
-| Trace ID or link |  |  |
-| Total trace duration |  |  |
-| Research Agent duration |  |  |
-| Injected-delay span duration | Not present |  |
-| Analysis Agent duration |  |  |
-| Input tokens |  |  |
-| Output tokens |  |  |
-| Total tokens |  |  |
-| Cost shown by Langfuse |  |  |
-| Errors or missing usage data |  |  |
+| Observation                  | Baseline trace (`SLOW_REQUEST=false`) | Delayed trace (`SLOW_REQUEST=true`) |
+| ---------------------------- | ------------------------------------- | ----------------------------------- |
+| Trace ID or link             |                                       |                                     |
+| Total trace duration         |                                       |                                     |
+| Research Agent duration      |                                       |                                     |
+| Injected-delay span duration | Not present                           |                                     |
+| Analysis Agent duration      |                                       |                                     |
+| Input tokens                 |                                       |                                     |
+| Output tokens                |                                       |                                     |
+| Total tokens                 |                                       |                                     |
+| Cost shown by Langfuse       |                                       |                                     |
+| Errors or missing usage data |                                       |                                     |
 
 ### Conclusions
 

@@ -1,4 +1,3 @@
-
 import os
 import unittest
 from unittest.mock import MagicMock, patch
@@ -47,17 +46,40 @@ class ApplicationTests(unittest.TestCase):
             response.json,
             {"reply": "Hello! How can I help you today?"},
         )
-  
+
         # Both Research Agent and Analysis Agent call Gemini.
         self.assertEqual(
             mock_client.models.generate_content.call_count,
             2,
         )
-        
+
         calls = mock_client.models.generate_content.call_args_list
         self.assertEqual(len(calls), 2)
         self.assertIn("Research Agent", calls[0].kwargs["contents"])
         self.assertIn("Analysis Agent", calls[1].kwargs["contents"])
+
+    def test_research_path_can_select_detailed_mode(self):
+        mock_response = MagicMock()
+        mock_response.text = "Detailed answer"
+
+        mock_client = MagicMock()
+        mock_client.models.generate_content.return_value = mock_response
+
+        with (
+            patch.dict(os.environ, {"RESEARCH_PTH": "deep"}),
+            patch("app.get_gemini_client", return_value=mock_client),
+            patch("app.langfuse.start_as_current_observation"),
+        ):
+            response = self.client.post(
+                "/chat",
+                json={"message": "Hello"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        calls = mock_client.models.generate_content.call_args_list
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0].kwargs["config"]["max_output_tokens"], 1024)
+        self.assertIn("comprehensive research brief", calls[0].kwargs["contents"])
 
     def test_invalid_messages_are_rejected(self):
         for payload in (
@@ -104,14 +126,11 @@ class ApplicationTests(unittest.TestCase):
             response.json,
             {"error": "The request could not be completed."},
         )
-        
+
     def test_redact_pii_masks_email_and_phone(self):
         from app import redact_pii
 
-        text = (
-            "Contact priya@example.com "
-            "or call +91 98765 43210."
-        )
+        text = "Contact priya@example.com " "or call +91 98765 43210."
 
         redacted = redact_pii(text)
 
