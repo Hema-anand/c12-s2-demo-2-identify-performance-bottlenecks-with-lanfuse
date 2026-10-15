@@ -11,6 +11,20 @@ class ApplicationTests(unittest.TestCase):
         app.app.config["TESTING"] = True
         self.client = app.app.test_client()
 
+        env = patch.dict(os.environ, {
+            "SLOW_REQUEST": "false",
+            "RESEARCH_DEPTH": "standard",
+            "REDACT_PII": "true",
+        })
+        env.start()
+        self.addCleanup(env.stop)
+
+        flush = patch("app.langfuse.flush")
+        flush.start()
+        self.addCleanup(flush.stop)
+        app.app.config["TESTING"] = True
+        self.client = app.app.test_client()
+
     def test_health_identifies_deployed_version(self):
         with patch.dict(os.environ, {"APP_VERSION": "test-version"}):
             response = self.client.get("/health")
@@ -66,7 +80,7 @@ class ApplicationTests(unittest.TestCase):
         mock_client.models.generate_content.return_value = mock_response
 
         with (
-            patch.dict(os.environ, {"RESEARCH_PTH": "deep"}),
+            patch.dict(os.environ, {"RESEARCH_DEPTH": "detailed"}),
             patch("app.get_gemini_client", return_value=mock_client),
             patch("app.langfuse.start_as_current_observation"),
         ):
